@@ -15,11 +15,11 @@ repositories {
 }
 
 // build.gradle.kts
-implementation("com.github.better-auth-rs.better-auth-kotlin-client:better-auth-kotlin-client:v0.2.0")
+implementation("com.github.better-auth-rs.better-auth-kotlin-client:better-auth-kotlin-client:v0.1.1")
 // Optional Android persistence:
-implementation("com.github.better-auth-rs.better-auth-kotlin-client:better-auth-kotlin-client-android:v0.2.0")
+implementation("com.github.better-auth-rs.better-auth-kotlin-client:better-auth-kotlin-client-android:v0.1.1")
 // Optional backend persistence:
-implementation("com.github.better-auth-rs.better-auth-kotlin-client:better-auth-kotlin-client-redis:v0.2.0")
+implementation("com.github.better-auth-rs.better-auth-kotlin-client:better-auth-kotlin-client-redis:v0.1.1")
 ```
 
 Add the core and the adapter required by your application. Each adapter already depends on the core. The repository-level JitPack coordinate aggregates all three modules; use the module coordinates above.

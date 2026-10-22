@@ -1,10 +1,10 @@
-# Migrate from v0.1.0 to v0.2.0
+# Migrate from v0.1.0 to v0.1.1
 
-Version 0.2.0 expands the client and changes the public API and JitPack coordinates. Existing 0.1.0 artifacts remain available.
+Version 0.1.1 expands the client and changes the public API and JitPack coordinates. Existing 0.1.0 artifacts remain available.
 
-| v0.1.0 | v0.2.0 |
+| v0.1.0 | v0.1.1 |
 | --- | --- |
-| `com.github.better-auth-rs:better-auth-kotlin-client:v0.1.0` | `com.github.better-auth-rs.better-auth-kotlin-client:better-auth-kotlin-client:v0.2.0` |
+| `com.github.better-auth-rs:better-auth-kotlin-client:v0.1.0` | `com.github.better-auth-rs.better-auth-kotlin-client:better-auth-kotlin-client:v0.1.1` |
 | `BetterAuthClient(url)` | `BetterAuthClient { baseUrl = url }` |
 | `signUpEmail(...)` | `signUp.email(...).getOrThrow()` |
 | `signInEmail(...)` | `signIn.email(...).getOrThrow()`; handle `SignInOutcome.TwoFactorRequired` when the server enables 2FA |
