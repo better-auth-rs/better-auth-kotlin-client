@@ -6,17 +6,24 @@ The client uses Ktor CIO and suspend functions. It targets JVM 17 and Android AP
 
 ## Use
 
-This repository has no published release. Build and publish the snapshot to your local Maven repository:
+Use Kotlin 2.4.21 in the consuming project. Add JitPack to your repositories in `settings.gradle.kts`:
 
-```sh
-devenv shell -- ./gradlew check publishToMavenLocal
+```kotlin
+dependencyResolutionManagement {
+    repositories {
+        mavenCentral()
+        maven("https://jitpack.io") {
+            content { includeGroup("com.github.better-auth-rs") }
+        }
+    }
+}
 ```
 
-Use Kotlin 2.4.21 in the consuming project. Add `mavenLocal()` to your application's repositories, then add:
+Add the dependency to the application module:
 
 ```kotlin
 dependencies {
-    implementation("io.github.better-auth-rs:better-auth-kotlin-client:0.1.0-SNAPSHOT")
+    implementation("com.github.better-auth-rs:better-auth-kotlin-client:v0.1.0")
 }
 ```
 
@@ -52,10 +59,24 @@ The [devenv](https://devenv.sh) configuration installs JDK 17 and Gradle. The Gr
 ```sh
 devenv shell
 ./gradlew ktlintFormat
-./gradlew check
+check
 ```
 
-`check` runs Kotlin lint and protocol tests. Tests use Ktor MockEngine and a local HTTP server; tests do not require a running Better Auth server.
+`check` runs GitHub Actions lint, Kotlin lint, and protocol tests. Tests use Ktor MockEngine and a local HTTP server; tests do not require a running Better Auth server.
+
+## Release
+
+Push development changes directly to `master`. CI runs the checks on every push and pull request. To publish a version:
+
+1. Set `version` in `gradle.properties` to the next `X.Y.Z` version. Update the dependency example above.
+2. Run `devenv shell -- check` before committing and pushing to `master`.
+3. Create the matching `vX.Y.Z` tag on the release commit. Push the tag to GitHub.
+
+The tag workflow runs the checks, requests a JitPack build, and verifies the published coordinates, commit, and JAR. After verification, the workflow creates the GitHub Release. JitPack uses the tag as the artifact version, including the `v` prefix. The workflow requires no additional secret for this public repository.
+
+Keep published tags unchanged. If a JitPack build fails, inspect its `build.log` before rerunning the failed workflow. JitPack caches failed builds; a cached failed build must be removed in the JitPack interface before retrying. Publish code fixes under a new version.
+
+For local development, run `devenv shell -- ./gradlew publishToMavenLocal` and use `io.github.better-auth-rs:better-auth-kotlin-client:0.1.0` from `mavenLocal()`.
 
 ## License
 

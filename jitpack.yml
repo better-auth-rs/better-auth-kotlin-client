@@ -1,0 +1,4 @@
+jdk:
+  - openjdk17
+install:
+  - ./gradlew --no-daemon build publishToMavenLocal -Pgroup="$GROUP" -Pversion="$VERSION"

@@ -1,6 +1,8 @@
 { pkgs, ... }:
 
 {
+  packages = [ pkgs.actionlint ];
+
   languages.java = {
     enable = true;
     jdk.package = pkgs.jdk17;
@@ -8,6 +10,6 @@
     lsp.enable = false;
   };
 
-  scripts.check.exec = "./gradlew check";
+  scripts.check.exec = "actionlint && ./gradlew check";
   enterTest = "check";
 }
