@@ -23,7 +23,7 @@ When a wrapper adds or removes an endpoint, update the expected inventory and th
 | Layer | Scope and evidence |
 | --- | --- |
 | JVM protocol and regression tests | 128 tests passed without skips. Includes request forwarding, response decoding, session lifecycle, cancellation, credential isolation, malformed responses, and local HTTP engine tests. |
-| Better Auth server integration | `ServerIntegrationTest` runs against the pinned Better Auth 1.7.12 fixture in `integration/`. Its four scenarios cover email/password lifecycle; cookie mode, email OTP, magic links, anonymous and one-time sessions; two-factor and phone verification; and admin/organization/team/role operations. This suite is separate from the 118-endpoint observation count. |
+| Better Auth server integration | All 4 scenarios passed without failures or skips against the pinned Better Auth 1.7.12 fixture in `integration/`. `ServerIntegrationTest` covers email/password lifecycle; cookie mode, email OTP, magic links, anonymous and one-time sessions; two-factor and phone verification; and admin/organization/team/role operations. This suite is separate from the 118-endpoint observation count. |
 | Android JVM tests | 22 tests passed without skips. Covers encrypted storage behavior and Android request/plugin hooks. |
 | Android device tests | 10 tests passed without skips on an API 36 emulator: 2 client tests and 8 Keystore/storage tests. `lintDebug` reported no errors. |
 | Redis cryptography | 3 AES-GCM unit tests passed without skips. |
