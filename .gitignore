@@ -1,0 +1,12 @@
+.gradle/
+.kotlin/
+build/
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+.direnv/
+.envrc.local
+.idea/
+*.iml
+local.properties
+.DS_Store
