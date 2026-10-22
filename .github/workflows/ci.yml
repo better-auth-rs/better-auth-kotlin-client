@@ -41,7 +41,7 @@ jobs:
           cache: npm
           cache-dependency-path: integration/package-lock.json
       - uses: android-actions/setup-android@v4.0.4
-      - run: sdkmanager 'platforms;android-37' 'build-tools;37.0.0'
+      - run: sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0'
       - uses: gradle/actions/setup-gradle@v6.4.0
       - name: Verify core, Android, Redis, Valkey, and publications
         env:
@@ -62,7 +62,7 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v4.0.4
-      - run: sdkmanager 'platforms;android-37' 'build-tools;37.0.0'
+      - run: sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0'
       - uses: gradle/actions/setup-gradle@v6.4.0
       - name: Enable KVM
         run: |
@@ -136,6 +136,8 @@ jobs:
               assert pom.findtext("m:groupId", namespaces=namespace) == group
               assert pom.findtext("m:artifactId", namespaces=namespace) == artifact
               assert pom.findtext("m:version", namespaces=namespace) == os.environ["RELEASE_TAG"]
+              license_urls = {license.findtext("m:url", namespaces=namespace) for license in pom.findall("m:licenses/m:license", namespace)}
+              assert license_urls == {"https://opensource.org/licenses/MIT", "https://www.apache.org/licenses/LICENSE-2.0.txt"}
               dependencies = pom.findall("m:dependencies/m:dependency", namespace)
               names = [dep.findtext("m:artifactId", namespaces=namespace) for dep in dependencies]
               if artifact == "better-auth-kotlin-client":
@@ -147,8 +149,13 @@ jobs:
               with zipfile.ZipFile(directory / f"{artifact}.{extension}") as archive:
                   assert archive.testzip() is None
                   assert entry in archive.namelist()
-                  notice = "assets/better-auth/NOTICE" if extension == "aar" else "META-INF/NOTICE"
-                  assert notice in archive.namelist()
+                  legal_paths = {
+                      "NOTICE": "assets/better-auth/NOTICE" if extension == "aar" else "META-INF/NOTICE",
+                      "LICENSE": "assets/better-auth/LICENSE" if extension == "aar" else "META-INF/LICENSE",
+                      "licenses/Apache-2.0.txt": "assets/better-auth/Apache-2.0.txt" if extension == "aar" else "META-INF/licenses/Apache-2.0.txt",
+                  }
+                  for source, member in legal_paths.items():
+                      assert archive.read(member) == Path(source).read_bytes(), (artifact, member)
           print("Verified all three JitPack modules, dependency coordinates, licenses, and release commit.")
           PYTHON
       - uses: actions/setup-java@v6.1.0
@@ -156,7 +163,7 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v4.0.4
-      - run: sdkmanager 'platforms;android-37' 'build-tools;37.0.0'
+      - run: sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0'
       - uses: gradle/actions/setup-gradle@v6.4.0
       - name: Compile independent JitPack consumers
         env:
