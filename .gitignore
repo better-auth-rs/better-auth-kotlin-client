@@ -10,3 +10,4 @@ devenv.local.yaml
 *.iml
 local.properties
 .DS_Store
+node_modules/

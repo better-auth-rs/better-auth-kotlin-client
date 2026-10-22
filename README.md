@@ -1,83 +1,50 @@
 # Better Auth Kotlin Client
 
-A Kotlin/JVM client for [Better Auth](https://www.better-auth.com) servers, including [better-auth-rs](https://github.com/better-auth-rs/better-auth-rs). The initial API covers email sign-up, email sign-in, session lookup, and sign-out.
+A Kotlin/JVM and Android SDK for [Better Auth](https://www.better-auth.com), including compatible [better-auth-rs](https://github.com/better-auth-rs/better-auth-rs) endpoints. The SDK covers account recovery, sessions, social authentication, 11 authentication and management plugins, and optional Android and Redis storage. Each server must enable the plugins used by the client.
 
-The client uses Ktor CIO and suspend functions. It targets JVM 17 and Android API 24 or later. Android device compatibility has not been verified. Cookie authentication, social sign-in, two-factor authentication, and Android-specific storage are not included.
+## Install
+
+Use Kotlin 2.4.21 and JVM 17. Android projects require `compileSdk` 37 and `minSdk` 24.
+
+```kotlin
+// settings.gradle.kts
+repositories {
+    google()
+    mavenCentral()
+    maven("https://jitpack.io")
+}
+
+// build.gradle.kts
+implementation("com.github.better-auth-rs.better-auth-kotlin-client:better-auth-kotlin-client:v0.2.0")
+// Optional Android persistence:
+implementation("com.github.better-auth-rs.better-auth-kotlin-client:better-auth-kotlin-client-android:v0.2.0")
+// Optional backend persistence:
+implementation("com.github.better-auth-rs.better-auth-kotlin-client:better-auth-kotlin-client-redis:v0.2.0")
+```
+
+Add the core and the adapter required by your application. Each adapter already depends on the core. The repository-level JitPack coordinate aggregates all three modules; use the module coordinates above.
 
 ## Use
-
-Use Kotlin 2.4.21 in the consuming project. Add JitPack to your repositories in `settings.gradle.kts`:
-
-```kotlin
-dependencyResolutionManagement {
-    repositories {
-        mavenCentral()
-        maven("https://jitpack.io") {
-            content { includeGroup("com.github.better-auth-rs") }
-        }
-    }
-}
-```
-
-Add the dependency to the application module:
-
-```kotlin
-dependencies {
-    implementation("com.github.better-auth-rs:better-auth-kotlin-client:v0.1.0")
-}
-```
-
-Enable email/password authentication and the [bearer plugin](https://www.better-auth.com/docs/plugins/bearer) on your server. Use the complete authentication base URL, including `/api/auth` or your custom handler path.
 
 ```kotlin
 import io.github.betterauth.client.BetterAuthClient
 
 suspend fun example() {
-    BetterAuthClient("https://example.com/api/auth").use { auth ->
-        val result = auth.signInEmail("ada@example.com", "your-password")
-        println(result.user.name)
-        val session = auth.getSession() // null means signed out
-        auth.signOut()
+    BetterAuthClient {
+        baseUrl = "https://example.com/api/auth"
+    }.use { auth ->
+        auth.signIn.email("ada@example.com", "your-password").getOrThrow()
+        val session = auth.getSession().getOrThrow()
+        println(session?.user?.name)
+        auth.signOut().getOrThrow()
     }
 }
 ```
 
-Create one client per signed-in user. Close the client when its owner is destroyed. Android applications must declare the `android.permission.INTERNET` permission and call suspend functions from a coroutine.
+Enable the server's bearer plugin for the default transport, or select cookie authentication. The default HTTP engine is Ktor OkHttp. Create one session per user and close the parent client when its owner is destroyed. Persist production credentials with a secure storage adapter.
 
-The client stores the signed `set-auth-token` response header in memory and sends that exact credential with subsequent requests. Signed credentials also work when the server enables `requireSignature`. A server that requires email verification can return a successful sign-up with `token = null`.
-
-The bearer-only API does not expose `rememberMe = false`; that mode depends on an additional cookie.
-
-Pass a `TokenStore` implementation to persist credentials across restarts. Implement `read()` and `write(token)`, where `write(null)` removes the credential. Use secure platform storage for production credentials. The default `InMemoryTokenStore` loses credentials when the process exits. Do not share a store between users or servers.
-
-HTTP failures throw `BetterAuthException` with `status`, `code`, and `message`. Network failures, coroutine cancellation, malformed responses, and storage failures propagate. A failed sign-out retains the local credential so the application can retry. Timestamps preserve the server's ISO 8601 strings. Unknown response fields are ignored.
-
-## Develop
-
-The [devenv](https://devenv.sh) configuration installs JDK 17 and Gradle. The Gradle Wrapper pins Gradle 9.7.0 and verifies its download checksum.
-
-```sh
-devenv shell
-./gradlew ktlintFormat
-check
-```
-
-`check` runs GitHub Actions lint, Kotlin lint, and protocol tests. Tests use Ktor MockEngine and a local HTTP server; tests do not require a running Better Auth server.
-
-## Release
-
-Push development changes directly to `master`. CI runs the checks on every push and pull request. To publish a version:
-
-1. Set `version` in `gradle.properties` to the next `X.Y.Z` version. Update the dependency example above.
-2. Run `devenv shell -- check` before committing and pushing to `master`.
-3. Create the matching `vX.Y.Z` tag on the release commit. Push the tag to GitHub.
-
-The tag workflow runs the checks, requests a JitPack build, and verifies the published coordinates, commit, and JAR. After verification, the workflow creates the GitHub Release. JitPack uses the tag as the artifact version, including the `v` prefix. The workflow requires no additional secret for this public repository.
-
-Keep published tags unchanged. If a JitPack build fails, inspect its `build.log` before rerunning the failed workflow. JitPack caches failed builds; a cached failed build must be removed in the JitPack interface before retrying. Publish code fixes under a new version.
-
-For local development, run `devenv shell -- ./gradlew publishToMavenLocal` and use `io.github.better-auth-rs:better-auth-kotlin-client:0.1.0` from `mavenLocal()`.
+See [usage and plugins](docs/usage.md), [coverage and verification](docs/coverage.md), [migration from v0.1.0](docs/migration.md), and [development and releases](docs/development.md).
 
 ## License
 
-[MIT](LICENSE).
+Original code uses [MIT](LICENSE). Adapted reference code uses [Apache-2.0](licenses/Apache-2.0.txt); see [NOTICE](NOTICE) for attribution and modifications.

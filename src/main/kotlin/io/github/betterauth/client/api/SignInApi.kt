@@ -1,0 +1,157 @@
+// SPDX-License-Identifier: Apache-2.0
+// Adapted by better-auth-rs; see NOTICE for upstream attribution and modification details.
+
+package io.github.betterauth.client.api
+
+import io.github.betterauth.client.BetterAuthClient
+import io.github.betterauth.client.http.Transport
+import io.github.betterauth.client.model.OperationResult
+import io.github.betterauth.client.model.SignInOutcome
+import io.github.betterauth.client.model.SocialSignInOutcome
+import io.github.betterauth.client.model.bool
+import io.github.betterauth.client.model.jsonBody
+import io.github.betterauth.client.model.str
+import io.github.betterauth.client.result.BetterAuthResult
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+
+/** Profile data Apple only sends on the very first sign-in; pass it along so the server can store the name. */
+public data class IdTokenUser(
+    val firstName: String? = null,
+    val lastName: String? = null,
+    val email: String? = null,
+)
+
+/** A provider-issued ID token for native social sign-in (Google One Tap / Sign in with Apple). */
+public data class IdTokenCredentials(
+    val token: String,
+    val nonce: String? = null,
+    val accessToken: String? = null,
+    val refreshToken: String? = null,
+    /** Epoch milliseconds, if the provider reports an expiry. */
+    val expiresAt: Long? = null,
+    val user: IdTokenUser? = null,
+)
+
+/** Provider ids accepted by `sign-in/social` and `link-social`. Any string works, these are just the built-in ones. */
+public object SocialProviders {
+    public const val APPLE: String = "apple"
+    public const val GOOGLE: String = "google"
+    public const val GITHUB: String = "github"
+    public const val FACEBOOK: String = "facebook"
+    public const val MICROSOFT: String = "microsoft"
+    public const val DISCORD: String = "discord"
+    public const val TWITTER: String = "twitter"
+    public const val LINKEDIN: String = "linkedin"
+}
+
+internal fun IdTokenCredentials.toJson(): JsonObject =
+    jsonBody {
+        put("token", token)
+        put("nonce", nonce)
+        put("accessToken", accessToken)
+        put("refreshToken", refreshToken)
+        put("expiresAt", expiresAt)
+        user?.let { u ->
+            put(
+                "user",
+                jsonBody {
+                    if (u.firstName != null || u.lastName != null) {
+                        put(
+                            "name",
+                            jsonBody {
+                                put("firstName", u.firstName)
+                                put("lastName", u.lastName)
+                            },
+                        )
+                    }
+                    put("email", u.email)
+                },
+            )
+        }
+    }
+
+internal fun JsonElement.toSignInOutcome(): SignInOutcome {
+    val o = asObject()
+    if (o.bool("twoFactorRedirect") == true) {
+        return SignInOutcome.TwoFactorRequired(o.strings("twoFactorMethods"))
+    }
+    return SignInOutcome.Authenticated(toAuthResponse())
+}
+
+/** `client.signIn` */
+public class SignInApi internal constructor(
+    internal val client: BetterAuthClient,
+) {
+    private val t: Transport get() = client.transport
+
+    /**
+     * Signs in with email and password.
+     *
+     * Returns [SignInOutcome.TwoFactorRequired] when the account has two-factor authentication; finish with
+     * `client.twoFactor.verifyTotp(...)`, `verifyOtp(...)` or `verifyBackupCode(...)`.
+     */
+    public suspend fun email(
+        email: String,
+        password: String,
+        callbackUrl: String? = null,
+        rememberMe: Boolean? = null,
+    ): BetterAuthResult<SignInOutcome> =
+        t.postCredentialResponse(
+            "/sign-in/email",
+            jsonBody {
+                put("email", email)
+                put("password", password)
+                put("callbackURL", callbackUrl)
+                put("rememberMe", rememberMe)
+            },
+            requiresCredential = { it is SignInOutcome.Authenticated },
+        ) { it.toSignInOutcome() }
+
+    /**
+     * Starts or completes a social sign-in.
+     *
+     * - Without [idToken]: returns [SocialSignInOutcome.RedirectRequired]. Do not open that URL directly: the OAuth
+     *   state cookie lives in the SDK's jar, not the browser's. Wrap it with `client.authorizationProxyUrl(url)`, open
+     *   the result in a browser (Custom Tabs), and when your deep link fires pass its `cookie` query parameter to
+     *   `client.completeBrowserSignIn(cookie)`. This is the flow of Better Auth's Expo plugin, so the server needs
+     *   `expo()` and your deep link in `trustedOrigins`.
+     * - With [idToken] (native Google/Apple sign-in): signs in directly and returns
+     *   [SocialSignInOutcome.Authenticated].
+     */
+    public suspend fun social(
+        provider: String,
+        callbackUrl: String? = null,
+        newUserCallbackUrl: String? = null,
+        errorCallbackUrl: String? = null,
+        idToken: IdTokenCredentials? = null,
+        scopes: List<String>? = null,
+        requestSignUp: Boolean? = null,
+        loginHint: String? = null,
+        disableRedirect: Boolean? = null,
+        additionalData: JsonObject? = null,
+    ): BetterAuthResult<SocialSignInOutcome> =
+        t.post(
+            "/sign-in/social",
+            jsonBody {
+                put("provider", provider)
+                put("callbackURL", callbackUrl)
+                put("newUserCallbackURL", newUserCallbackUrl)
+                put("errorCallbackURL", errorCallbackUrl)
+                put("idToken", idToken?.toJson())
+                putStrings("scopes", scopes)
+                put("requestSignUp", requestSignUp)
+                put("loginHint", loginHint)
+                put("disableRedirect", disableRedirect)
+                put("additionalData", additionalData)
+            },
+        ) { element ->
+            val o = element.asObject()
+            val url = o.str("url")
+            if (url != null && o.bool("redirect") != false) {
+                SocialSignInOutcome.RedirectRequired(url)
+            } else {
+                SocialSignInOutcome.Authenticated(element.toAuthResponse())
+            }
+        }
+}

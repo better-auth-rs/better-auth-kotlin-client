@@ -12,20 +12,75 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:8
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      valkey:
+        image: valkey/valkey:9
+        ports: ['6380:6379']
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-java@v6.1.0
         with:
           distribution: temurin
           java-version: '17'
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: integration/package-lock.json
+      - uses: android-actions/setup-android@v4.0.4
+      - run: sdkmanager 'platforms;android-37' 'build-tools;37.0.0'
       - uses: gradle/actions/setup-gradle@v6.4.0
-      - run: ./gradlew --no-daemon check publishToMavenLocal
+      - name: Verify core, Android, Redis, Valkey, and publications
+        env:
+          REDIS_URL: redis://localhost:6379
+          VALKEY_URL: redis://localhost:6380
+        run: ./gradlew --no-daemon check :redis:redisIntegrationTest publishToMavenLocal
+      - run: npm --prefix integration ci
+      - run: npm --prefix integration run check
+      - name: Test against Better Auth
+        run: npm --prefix integration test
+
+  android-device:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4.0.4
+      - run: sdkmanager 'platforms;android-37' 'build-tools;37.0.0'
+      - uses: gradle/actions/setup-gradle@v6.4.0
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: reactivecircus/android-emulator-runner@v2.38.0
+        with:
+          api-level: 36
+          arch: x86_64
+          disable-animations: true
+          script: ./gradlew --no-daemon :android:connectedDebugAndroidTest
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: check
+    needs: [check, android-device]
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     permissions:
       contents: write
     concurrency:
@@ -44,15 +99,18 @@ jobs:
           version=$(awk -F= '$1 == "version" { print $2 }' gradle.properties)
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "$RELEASE_TAG" = "v$version"
-      - name: Build and verify JitPack artifacts
+      - name: Build and verify JitPack modules
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          artifact=better-auth-kotlin-client
-          base="https://jitpack.io/com/github/better-auth-rs/$artifact/$RELEASE_TAG"
-          curl --fail --show-error --location --max-time 1200 "$base/$artifact-$RELEASE_TAG.pom" --output "$RUNNER_TEMP/sdk.pom"
-          curl --fail --show-error --location --max-time 120 "$base/$artifact-$RELEASE_TAG.jar" --output "$RUNNER_TEMP/sdk.jar"
-          curl --fail --show-error --location --max-time 30 "https://jitpack.io/api/builds/com.github.better-auth-rs/$artifact/$RELEASE_TAG" --output "$RUNNER_TEMP/jitpack.json"
+          base='https://jitpack.io/com/github/better-auth-rs/better-auth-kotlin-client'
+          for artifact in better-auth-kotlin-client better-auth-kotlin-client-android better-auth-kotlin-client-redis; do
+            extension=jar
+            if [[ "$artifact" == *-android ]]; then extension=aar; fi
+            curl --fail --show-error --location --max-time 1200 "$base/$artifact/$RELEASE_TAG/$artifact-$RELEASE_TAG.pom" --output "$RUNNER_TEMP/$artifact.pom"
+            curl --fail --show-error --location --max-time 120 "$base/$artifact/$RELEASE_TAG/$artifact-$RELEASE_TAG.$extension" --output "$RUNNER_TEMP/$artifact.$extension"
+          done
+          curl --fail --show-error --location --max-time 30 "https://jitpack.io/api/builds/com.github.better-auth-rs/better-auth-kotlin-client/$RELEASE_TAG" --output "$RUNNER_TEMP/jitpack.json"
           python3 - <<'PYTHON'
           import json
           import os
@@ -66,16 +124,44 @@ jobs:
           commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
           assert status["status"] == "ok", status
           assert status["commit"] == commit, status
-          pom = ElementTree.parse(directory / "sdk.pom").getroot()
+          group = "com.github.better-auth-rs.better-auth-kotlin-client"
+          modules = {
+              "better-auth-kotlin-client": ("jar", "io/github/betterauth/client/BetterAuthClient.class"),
+              "better-auth-kotlin-client-android": ("aar", "classes.jar"),
+              "better-auth-kotlin-client-redis": ("jar", "io/github/betterauth/client/redis/RedisStorage.class"),
+          }
           namespace = {"m": "http://maven.apache.org/POM/4.0.0"}
-          assert pom.findtext("m:groupId", namespaces=namespace) == "com.github.better-auth-rs"
-          assert pom.findtext("m:artifactId", namespaces=namespace) == "better-auth-kotlin-client"
-          assert pom.findtext("m:version", namespaces=namespace) == os.environ["RELEASE_TAG"]
-          with zipfile.ZipFile(directory / "sdk.jar") as jar:
-              assert jar.testzip() is None
-              assert "io/github/betterauth/client/BetterAuthClient.class" in jar.namelist()
-          print("Verified JitPack coordinates, commit, and client JAR.")
+          for artifact, (extension, entry) in modules.items():
+              pom = ElementTree.parse(directory / f"{artifact}.pom").getroot()
+              assert pom.findtext("m:groupId", namespaces=namespace) == group
+              assert pom.findtext("m:artifactId", namespaces=namespace) == artifact
+              assert pom.findtext("m:version", namespaces=namespace) == os.environ["RELEASE_TAG"]
+              dependencies = pom.findall("m:dependencies/m:dependency", namespace)
+              names = [dep.findtext("m:artifactId", namespaces=namespace) for dep in dependencies]
+              if artifact == "better-auth-kotlin-client":
+                  assert not any(name.endswith(("-android", "-redis")) for name in names), names
+              else:
+                  core = next(dep for dep in dependencies if dep.findtext("m:artifactId", namespaces=namespace) == "better-auth-kotlin-client")
+                  assert core.findtext("m:groupId", namespaces=namespace) == group
+                  assert core.findtext("m:version", namespaces=namespace) == os.environ["RELEASE_TAG"]
+              with zipfile.ZipFile(directory / f"{artifact}.{extension}") as archive:
+                  assert archive.testzip() is None
+                  assert entry in archive.namelist()
+                  notice = "assets/better-auth/NOTICE" if extension == "aar" else "META-INF/NOTICE"
+                  assert notice in archive.namelist()
+          print("Verified all three JitPack modules, dependency coordinates, licenses, and release commit.")
           PYTHON
+      - uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4.0.4
+      - run: sdkmanager 'platforms;android-37' 'build-tools;37.0.0'
+      - uses: gradle/actions/setup-gradle@v6.4.0
+      - name: Compile independent JitPack consumers
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: ./gradlew --no-daemon -p integration/consumer ktlintCheck verifyConsumers -PsdkVersion="$RELEASE_TAG"
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v3.0.3
         with:

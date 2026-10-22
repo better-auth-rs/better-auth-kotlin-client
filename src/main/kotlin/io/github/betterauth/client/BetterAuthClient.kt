@@ -1,169 +1,607 @@
+// SPDX-License-Identifier: Apache-2.0
+// Adapted by better-auth-rs; see NOTICE for upstream attribution and modification details.
+
 package io.github.betterauth.client
 
-import io.ktor.client.HttpClient
-import io.ktor.client.engine.HttpClientEngine
-import io.ktor.client.engine.cio.CIO
-import io.ktor.client.request.accept
-import io.ktor.client.request.bearerAuth
-import io.ktor.client.request.request
-import io.ktor.client.request.setBody
-import io.ktor.client.statement.HttpResponse
-import io.ktor.client.statement.bodyAsText
-import io.ktor.http.ContentType
+import io.github.betterauth.client.api.IdTokenCredentials
+import io.github.betterauth.client.api.SignInApi
+import io.github.betterauth.client.api.SignUpApi
+import io.github.betterauth.client.api.asObject
+import io.github.betterauth.client.api.get
+import io.github.betterauth.client.api.getForResult
+import io.github.betterauth.client.api.json
+import io.github.betterauth.client.api.jsonOrRedirect
+import io.github.betterauth.client.api.mapBody
+import io.github.betterauth.client.api.post
+import io.github.betterauth.client.api.postForResult
+import io.github.betterauth.client.api.toAuthResponse
+import io.github.betterauth.client.api.toJson
+import io.github.betterauth.client.api.toOperationResult
+import io.github.betterauth.client.api.toSession
+import io.github.betterauth.client.api.toSessionList
+import io.github.betterauth.client.api.toUser
+import io.github.betterauth.client.config.BetterAuthConfig
+import io.github.betterauth.client.http.BearerSessionTransport
+import io.github.betterauth.client.http.BetterAuthJson
+import io.github.betterauth.client.http.CookieJar
+import io.github.betterauth.client.http.Transport
+import io.github.betterauth.client.model.AccessTokenResult
+import io.github.betterauth.client.model.Account
+import io.github.betterauth.client.model.AccountInfo
+import io.github.betterauth.client.model.AuthResponse
+import io.github.betterauth.client.model.LinkSocialResult
+import io.github.betterauth.client.model.OperationResult
+import io.github.betterauth.client.model.RedirectResponse
+import io.github.betterauth.client.model.Session
+import io.github.betterauth.client.model.SessionData
+import io.github.betterauth.client.model.SignOutResult
+import io.github.betterauth.client.model.SocialSignInOutcome
+import io.github.betterauth.client.model.User
+import io.github.betterauth.client.model.VerifyEmailResult
+import io.github.betterauth.client.model.bool
+import io.github.betterauth.client.model.jsonBody
+import io.github.betterauth.client.model.obj
+import io.github.betterauth.client.model.str
+import io.github.betterauth.client.plugin.PluginContext
+import io.github.betterauth.client.plugin.PluginKey
+import io.github.betterauth.client.plugin.PluginRegistry
+import io.github.betterauth.client.result.BetterAuthError
+import io.github.betterauth.client.result.BetterAuthResult
+import io.github.betterauth.client.session.InMemorySessionStore
+import io.github.betterauth.client.session.StorageLockKey
+import io.github.betterauth.client.session.StorageSessionStore
+import io.github.betterauth.client.session.StoredSession
+import io.github.betterauth.client.storage.KeyValueStorage
 import io.ktor.http.HttpMethod
-import io.ktor.http.contentType
-import io.ktor.http.isSuccess
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.serialization.SerialName
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
-import java.io.Closeable
-import java.net.URI
+import kotlinx.serialization.DeserializationStrategy
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.serializer
+import kotlin.time.Clock
 
 /**
- * A single-user client for a server with the Better Auth bearer plugin enabled.
- * Authenticated email responses must include the signed set-auth-token header.
- * [baseUrl] includes the auth handler path. This client owns and closes [engine].
+ * Entry point of the SDK.
+ *
+ * ```kotlin
+ * val auth = BetterAuthClient {
+ *     baseUrl = "https://api.example.com/api/auth"
+ *     plugins(twoFactorClient(), organizationClient())   // only what you register exists
+ * }
+ * when (val result = auth.signIn.email("a@b.co", "secret")) {
+ *     is BetterAuthResult.Success -> ...
+ *     is BetterAuthResult.Failure -> ...
+ * }
+ * ```
+ *
+ * All calls are `suspend` and never throw for API or network failures; they return a [BetterAuthResult].
+ * The client is thread-safe. Call [close] when you are done with it.
  */
-public class BetterAuthClient(
-    baseUrl: String,
-    private val tokenStore: TokenStore = InMemoryTokenStore(),
-    engine: HttpClientEngine? = null,
-) : Closeable {
-    private val baseUrl =
-        URI(baseUrl)
-            .also {
-                require(it.scheme?.lowercase() in setOf("http", "https") && it.host != null) {
-                    "baseUrl must be an absolute HTTP or HTTPS URL"
+public class BetterAuthClient internal constructor(
+    internal val transport: Transport,
+    internal val registry: PluginRegistry,
+) : AutoCloseable {
+    /** Email sign-up. */
+    public val signUp: SignUpApi = SignUpApi(transport)
+
+    /**
+     * Email and social sign-in. Plugins add more to it when registered, e.g. `signIn.magicLink(...)` with
+     * `magicLinkClient()`.
+     */
+    public val signIn: SignInApi = SignInApi(this)
+
+    private val pluginApis = HashMap<PluginKey<*>, Any>()
+
+    /**
+     * The API of a registered plugin. Plugin APIs are available as extension properties (`auth.twoFactor`,
+     * `auth.organization`, ...) which call this. Throws [IllegalStateException] when the plugin was not registered
+     * with `plugins(...)`.
+     */
+    public fun <A : Any> plugin(key: PluginKey<A>): A =
+        pluginOrNull(key) ?: throw IllegalStateException(
+            "Plugin '${key.name}' is not installed. Add ${key.installHint} to plugins(...) when building the client.",
+        )
+
+    /** Like [plugin], or `null` when the plugin was not registered. */
+    public fun <A : Any> pluginOrNull(key: PluginKey<A>): A? {
+        val plugin = registry.find(key) ?: return null
+        synchronized(pluginApis) {
+            @Suppress("UNCHECKED_CAST")
+            return pluginApis.getOrPut(key) { plugin.createApi(PluginContext(transport)) } as A
+        }
+    }
+
+    public fun isInstalled(key: PluginKey<*>): Boolean = key in registry
+
+    // --- session ------------------------------------------------------------------------------------------------
+
+    /**
+     * Fetches the current session. A successful `null` means "not signed in" (the server answered `null`);
+     * that is not an error.
+     *
+     * @param disableCookieCache Skip the server's cookie cache and read the database.
+     * @param disableRefresh Do not extend the session's expiry.
+     */
+    public suspend fun getSession(
+        disableCookieCache: Boolean = false,
+        disableRefresh: Boolean = false,
+    ): BetterAuthResult<SessionData?> =
+        transport.executeAndProcess(
+            HttpMethod.Get,
+            "/get-session",
+            query =
+                mapOf(
+                    "disableCookieCache" to if (disableCookieCache) "true" else null,
+                    "disableRefresh" to if (disableRefresh) "true" else null,
+                ),
+        ) { raw ->
+            val result =
+                when (raw) {
+                    is BetterAuthResult.Failure -> {
+                        raw
+                    }
+
+                    is BetterAuthResult.Success -> {
+                        mapBody(raw.value) {
+                            require(raw.value.bodyText.isNotBlank()) { "The get-session response must contain JSON" }
+                            it.toSessionDataOrNull()
+                        }
+                    }
                 }
-                require(it.rawUserInfo == null && it.rawQuery == null && it.rawFragment == null) {
-                    "baseUrl must not contain user information, a query, or a fragment"
+            if (result is BetterAuthResult.Success) {
+                if (result.value == null) {
+                    transport.store.setSessionCache(null)
+                    transport.store.set(CookieJar.clearSession(transport.store.get(), transport.cookiePrefix))
+                } else if (transport.cacheEnabled) {
+                    transport.store.setSessionCache(result.value.toCacheJson())
                 }
-            }.toASCIIString()
-            .trimEnd('/')
-    private val engine = engine ?: CIO.create()
-    private val mutex = Mutex()
-    private val json = Json { ignoreUnknownKeys = true }
-    private val http =
-        HttpClient(this.engine) {
-            followRedirects = false
-            expectSuccess = false
+            }
+            result
         }
 
-    public suspend fun signUpEmail(
-        name: String,
-        email: String,
-        password: String,
+    /**
+     * The last session `get-session` returned, read from storage without a network call, or `null` if there is none
+     * or it has expired. Use it to render the signed-in UI at launch, then call [getSession] to confirm.
+     * Always `null` when `disableCache` is set.
+     */
+    public suspend fun cachedSession(): SessionData? {
+        if (!transport.cacheEnabled) return null
+        val raw = transport.cachedSessionJson() ?: return null
+        val data = BetterAuthJson.parseToJsonElement(raw).toSessionDataOrNull() ?: return null
+        val expiresAt = data.session.expiresAt ?: return null
+        val valid = data.user.id.isNotEmpty() && data.session.id.isNotEmpty() && expiresAt > Clock.System.now()
+        return data.takeIf { valid }
+    }
+
+    /** Signs out on the server and forgets the local session. */
+    public suspend fun signOut(): BetterAuthResult<SignOutResult> =
+        transport.executeAndProcess(
+            HttpMethod.Post,
+            "/sign-out",
+        ) { raw ->
+            val result =
+                when (raw) {
+                    is BetterAuthResult.Failure -> {
+                        raw
+                    }
+
+                    is BetterAuthResult.Success -> {
+                        mapBody(raw.value) { element ->
+                            val o = element.asObject()
+                            SignOutResult(o.bool("success") ?: true, o.str("url"), o.bool("redirect") ?: false)
+                        }
+                    }
+                }
+            val unauthorized = (result.errorOrNull() as? BetterAuthError.Api)?.status == 401
+            if (result.isSuccess || unauthorized) {
+                transport.store.setSessionCache(null)
+                transport.store.set(CookieJar.clearSession(transport.store.get(), transport.cookiePrefix))
+            }
+            result
+        }
+
+    /** Updates session fields. [fields] is merged into the request body as-is. */
+    public suspend fun updateSession(fields: JsonObject): BetterAuthResult<Session?> =
+        transport.post("/update-session", fields) { it.asObject().obj("session")?.toSession() }
+
+    public suspend fun listSessions(): BetterAuthResult<List<Session>> = transport.get("/list-sessions") { it.toSessionList() }
+
+    public suspend fun revokeSession(token: String): BetterAuthResult<OperationResult> =
+        transport.postForResult("/revoke-session", jsonBody { put("token", token) })
+
+    public suspend fun revokeSessions(): BetterAuthResult<OperationResult> = transport.postForResult("/revoke-sessions")
+
+    public suspend fun revokeOtherSessions(): BetterAuthResult<OperationResult> = transport.postForResult("/revoke-other-sessions")
+
+    // --- user ---------------------------------------------------------------------------------------------------
+
+    /**
+     * Updates the signed-in user. Standard fields are [name] and [image]; put anything from your server's
+     * `user.additionalFields` in [additionalFields].
+     */
+    public suspend fun updateUser(
+        name: String? = null,
         image: String? = null,
+        additionalFields: JsonObject? = null,
+    ): BetterAuthResult<OperationResult> =
+        transport.postForResult(
+            "/update-user",
+            jsonBody {
+                putAll(additionalFields)
+                put("name", name)
+                put("image", image)
+            },
+        )
+
+    public suspend fun changeEmail(
+        newEmail: String,
         callbackUrl: String? = null,
-    ): SignUpResponse =
-        mutex.withLock {
-            request(
-                "sign-up/email",
-                HttpMethod.Post,
-                json.encodeToString(SignUpRequest(name, email, password, image, callbackUrl)),
-            )
-        }
+    ): BetterAuthResult<OperationResult> =
+        transport.postForResult(
+            "/change-email",
+            jsonBody {
+                put("newEmail", newEmail)
+                put("callbackURL", callbackUrl)
+            },
+        )
 
-    public suspend fun signInEmail(
-        email: String,
-        password: String,
+    /** Changes the password. With [revokeOtherSessions] the server issues a fresh token, which the SDK stores. */
+    public suspend fun changePassword(
+        currentPassword: String,
+        newPassword: String,
+        revokeOtherSessions: Boolean? = null,
+    ): BetterAuthResult<AuthResponse> =
+        transport.post(
+            "/change-password",
+            jsonBody {
+                put("currentPassword", currentPassword)
+                put("newPassword", newPassword)
+                put("revokeOtherSessions", revokeOtherSessions)
+            },
+        ) { it.toAuthResponse() }
+
+    /** Deletes the signed-in user. Depending on server config you must pass [password], a [token], or neither. */
+    public suspend fun deleteUser(
+        password: String? = null,
+        token: String? = null,
         callbackUrl: String? = null,
-    ): SignInResponse =
-        mutex.withLock {
-            request(
-                "sign-in/email",
-                HttpMethod.Post,
-                json.encodeToString(SignInRequest(email, password, callbackUrl)),
-            )
-        }
-
-    public suspend fun getSession(): SessionData? =
-        mutex.withLock {
-            request<SessionData?>("get-session", HttpMethod.Get).also {
-                if (it == null) tokenStore.write(null)
-            }
-        }
-
-    public suspend fun signOut(): Unit =
-        mutex.withLock {
-            request<SignOutResponse>("sign-out", HttpMethod.Post, "{}")
-            tokenStore.write(null)
-        }
-
-    private suspend inline fun <reified T> request(
-        path: String,
-        method: HttpMethod,
-        body: String? = null,
-    ): T {
-        val token = tokenStore.read()
-        val response =
-            http.request("$baseUrl/$path") {
-                this.method = method
-                accept(ContentType.Application.Json)
-                if (token != null) bearerAuth(token)
-                if (body != null) {
-                    contentType(ContentType.Application.Json)
-                    setBody(body)
+    ): BetterAuthResult<OperationResult> =
+        transport.executeAndProcess(
+            HttpMethod.Post,
+            "/delete-user",
+            body =
+                jsonBody {
+                    put("password", password)
+                    put("token", token)
+                    put("callbackURL", callbackUrl)
+                },
+        ) { raw ->
+            val result =
+                when (raw) {
+                    is BetterAuthResult.Failure -> raw
+                    is BetterAuthResult.Success -> mapBody(raw.value) { it.toOperationResult() }
                 }
+            if (result is BetterAuthResult.Success && result.value.success && result.value.message == "User deleted") {
+                transport.store.clear()
             }
-        if (!response.status.isSuccess()) throw response.toException()
-        val result = json.decodeFromString<T>(response.bodyAsText())
-        val credential = response.headers["set-auth-token"]
-        if (result is SignInResponse || (result is SignUpResponse && result.token != null)) {
-            check(!credential.isNullOrBlank()) {
-                "Authenticated responses must include set-auth-token. Enable the Better Auth bearer plugin."
-            }
+            result
         }
-        if (credential != null) tokenStore.write(credential)
-        return result
+
+    // --- email verification and password reset -------------------------------------------------------------------
+
+    public suspend fun sendVerificationEmail(
+        email: String,
+        callbackUrl: String? = null,
+    ): BetterAuthResult<OperationResult> =
+        transport.postForResult(
+            "/send-verification-email",
+            jsonBody {
+                put("email", email)
+                put("callbackURL", callbackUrl)
+            },
+        )
+
+    /** Verifies an email token from a link. With [callbackUrl] the server redirects; see [VerifyEmailResult.redirect]. */
+    public suspend fun verifyEmail(
+        token: String,
+        callbackUrl: String? = null,
+    ): BetterAuthResult<VerifyEmailResult> =
+        transport.jsonOrRedirect(
+            HttpMethod.Get,
+            "/verify-email",
+            query = mapOf("token" to token, "callbackURL" to callbackUrl),
+            onRedirect = { VerifyEmailResult(success = true, redirect = it) },
+        ) { element ->
+            val o = element.asObject()
+            VerifyEmailResult(success = o.bool("status") ?: true, user = o.obj("user")?.toUser())
+        }
+
+    /** Emails a password reset link. [redirectTo] is where the link sends the user (your app or web page). */
+    public suspend fun requestPasswordReset(
+        email: String,
+        redirectTo: String? = null,
+    ): BetterAuthResult<OperationResult> =
+        transport.postForResult(
+            "/request-password-reset",
+            jsonBody {
+                put("email", email)
+                put("redirectTo", redirectTo)
+            },
+        )
+
+    /** Sets a new password using the token from the reset link. */
+    public suspend fun resetPassword(
+        newPassword: String,
+        token: String? = null,
+    ): BetterAuthResult<OperationResult> =
+        transport.postForResult(
+            "/reset-password",
+            jsonBody {
+                put("newPassword", newPassword)
+                put("token", token)
+            },
+        )
+
+    /** Checks the signed-in user's password. A wrong password comes back as an [BetterAuthError.Api] failure. */
+    public suspend fun verifyPassword(password: String): BetterAuthResult<OperationResult> =
+        transport.postForResult("/verify-password", jsonBody { put("password", password) })
+
+    /**
+     * The server's reset-link endpoint. It validates [token] and answers with a redirect to
+     * `callbackUrl?token=...`; the redirect is returned, not followed.
+     */
+    public suspend fun resetPasswordCallback(
+        token: String,
+        callbackUrl: String,
+    ): BetterAuthResult<RedirectResponse> =
+        transport.jsonOrRedirect(
+            HttpMethod.Get,
+            "/reset-password/$token",
+            query = mapOf("callbackURL" to callbackUrl),
+            onRedirect = { it },
+        ) { RedirectResponse(200, null) }
+
+    // --- accounts -----------------------------------------------------------------------------------------------
+
+    public suspend fun listAccounts(): BetterAuthResult<List<Account>> =
+        transport.call(HttpMethod.Get, "/list-accounts", ListSerializer(Account.serializer()))
+
+    /**
+     * Links a social account to the signed-in user. Without [idToken] the result carries a URL to open;
+     * with one the account is linked immediately.
+     */
+    public suspend fun linkSocial(
+        provider: String,
+        callbackUrl: String? = null,
+        errorCallbackUrl: String? = null,
+        idToken: IdTokenCredentials? = null,
+        scopes: List<String>? = null,
+        requestSignUp: Boolean? = null,
+        disableRedirect: Boolean? = null,
+        additionalData: JsonObject? = null,
+    ): BetterAuthResult<LinkSocialResult> =
+        transport.post(
+            "/link-social",
+            jsonBody {
+                put("provider", provider)
+                put("callbackURL", callbackUrl)
+                put("errorCallbackURL", errorCallbackUrl)
+                put("idToken", idToken?.toJson())
+                putStrings("scopes", scopes)
+                put("requestSignUp", requestSignUp)
+                put("disableRedirect", disableRedirect)
+                put("additionalData", additionalData)
+            },
+        ) { element ->
+            val o = element.asObject()
+            LinkSocialResult(o.str("url"), o.bool("redirect") ?: false, o.bool("status"))
+        }
+
+    public suspend fun unlinkAccount(accountId: String): BetterAuthResult<OperationResult> =
+        transport.postForResult("/unlink-account", jsonBody { put("accountId", accountId) })
+
+    /**
+     * Returns a valid provider access token for a linked account, refreshing it if needed.
+     * Identify the account by [accountId], or set [useAccountCookie] when the server stores account cookies.
+     */
+    public suspend fun getAccessToken(
+        accountId: String? = null,
+        useAccountCookie: Boolean = false,
+        userId: String? = null,
+    ): BetterAuthResult<AccessTokenResult> =
+        transport.call(
+            HttpMethod.Post,
+            "/get-access-token",
+            AccessTokenResult.serializer(),
+            body = accountSelection(accountId, useAccountCookie, userId),
+        )
+
+    /** Forces a refresh of a linked account's provider tokens. */
+    public suspend fun refreshToken(
+        accountId: String? = null,
+        useAccountCookie: Boolean = false,
+        userId: String? = null,
+    ): BetterAuthResult<AccessTokenResult> =
+        transport.call(
+            HttpMethod.Post,
+            "/refresh-token",
+            AccessTokenResult.serializer(),
+            body = accountSelection(accountId, useAccountCookie, userId),
+        )
+
+    public suspend fun accountInfo(accountId: String? = null): BetterAuthResult<AccountInfo> =
+        transport.call(HttpMethod.Get, "/account-info", AccountInfo.serializer(), query = mapOf("accountId" to accountId))
+
+    /** Health check (`GET /ok`). */
+    public suspend fun ok(): BetterAuthResult<Boolean> = transport.get("/ok") { it.asObject().bool("ok") ?: true }
+
+    // --- local session ------------------------------------------------------------------------------------------
+
+    /**
+     * The `Cookie` header value for the stored cookies, like the Expo client's `getCookie()`. Use it to call another
+     * Better Auth-backed service from outside this SDK.
+     */
+    public suspend fun cookieHeader(): String? = CookieJar.header(transport.storedSession(), System.currentTimeMillis()) { true }
+
+    /** The session token the SDK would send as a bearer credential, if any. */
+    public suspend fun currentToken(): String? = transport.storedSession().token
+
+    /** Snapshot of everything the SDK remembers (token, JWT, cookies). */
+    public suspend fun storedSession(): StoredSession = transport.storedSession()
+
+    /** Restores a previously saved session, e.g. from your own secure storage. Does not talk to the server. */
+    public suspend fun restoreSession(session: StoredSession) {
+        transport.restoreSession(session)
     }
 
-    private suspend fun HttpResponse.toException(): BetterAuthException {
-        val type = contentType()
-        val error =
-            if (type?.match(ContentType.Application.Json) == true || type?.contentSubtype?.endsWith("+json") == true) {
-                json.decodeFromString<ApiError>(bodyAsText())
-            } else {
-                ApiError(status.description)
-            }
-        return BetterAuthException(status.value, error.code, error.message)
+    /** Restores just a bearer token. */
+    public suspend fun restoreToken(token: String) {
+        transport.restoreToken(token)
     }
+
+    /**
+     * The URL to open in a browser (Custom Tabs) for a redirect-based social sign-in or account link. It goes
+     * through the server's `/expo-authorization-proxy`, which plants the OAuth state cookie in the browser.
+     * [authorizationUrl] is the `url` from [SocialSignInOutcome.RedirectRequired] or [LinkSocialResult].
+     * Requires the `expo()` plugin on the server.
+     */
+    public suspend fun authorizationProxyUrl(authorizationUrl: String): String =
+        transport.authorizationProxyUrl(authorizationUrl, transport.oauthState())
+
+    /**
+     * Finishes a browser sign-in. Pass the `cookie` query parameter of the deep link the server redirected to;
+     * the session it carries is stored. Follow with [getSession] to load the user.
+     */
+    public suspend fun completeBrowserSignIn(cookieParameter: String) {
+        transport.importSetCookies(CookieJarAccess.split(cookieParameter))
+    }
+
+    /** Forgets the entire local session, cookies included, without calling the server. */
+    public suspend fun clearLocalSession() {
+        transport.clearLocalSession()
+    }
+
+    /**
+     * A view of this client that authenticates as the holder of [token], with its own isolated session and cookie
+     * jar. This view uses bearer authentication, including when the parent uses cookies. The view shares the
+     * parent's connection pool. Use the view on backends that validate many users' tokens:
+     *
+     * ```kotlin
+     * val session = auth.withSession(bearerFromRequest).getSession()
+     * ```
+     *
+     * Closing the returned client does not close the parent.
+     */
+    public fun withSession(token: String): BetterAuthClient {
+        require(token.isNotBlank()) { "The session token must not be blank" }
+        return BetterAuthClient(
+            transport.scoped(InMemorySessionStore(StoredSession(token = token)), sessionTransport = BearerSessionTransport),
+            registry,
+        )
+    }
+
+    /**
+     * A view of this client that persists its session in [storage] under [prefix] instead of the configured store,
+     * sharing this client's connection pool. A backend uses one storage (Redis) and one prefix per end user:
+     *
+     * ```kotlin
+     * val perUser = auth.withStorage(RedisStorage(commands), prefix = "user-$userId")
+     * ```
+     *
+     * Views from this parent over the same [storage] and [prefix] share a lock for requests and local session changes.
+     * Closing the returned client does not close the parent.
+     */
+    public fun withStorage(
+        storage: KeyValueStorage,
+        prefix: String = transport.storagePrefix,
+    ): BetterAuthClient =
+        BetterAuthClient(
+            transport.scoped(StorageSessionStore(storage, prefix), lockKey = StorageLockKey(System.identityHashCode(storage), prefix)),
+            registry,
+        )
+
+    // --- escape hatch -------------------------------------------------------------------------------------------
+
+    /**
+     * Calls any Better Auth endpoint, including ones from plugins this SDK does not wrap yet.
+     * [method] is `"GET"` or `"POST"`; [path] is relative to `baseUrl` (e.g. `"/passkey/list-user-passkeys"`).
+     * For GET requests put parameters in [query]; for POST requests put them in [body].
+     */
+    public suspend fun request(
+        method: String,
+        path: String,
+        body: JsonElement? = null,
+        query: Map<String, String?> = emptyMap(),
+    ): BetterAuthResult<JsonElement> = transport.json(HttpMethod.parse(method.uppercase()), path, query, body) { it }
+
+    /** Like [request], decoding the response with [deserializer]. */
+    public suspend fun <T> request(
+        method: String,
+        path: String,
+        deserializer: DeserializationStrategy<T>,
+        body: JsonElement? = null,
+        query: Map<String, String?> = emptyMap(),
+    ): BetterAuthResult<T> = transport.call(HttpMethod.parse(method.uppercase()), path, deserializer, query, body)
 
     override fun close() {
-        try {
-            http.close()
-        } finally {
-            engine.close()
+        transport.close()
+    }
+
+    public companion object {
+        /** Java-friendly factory: `BetterAuthClient.create(config)`. */
+        @JvmStatic
+        public fun create(config: BetterAuthConfig): BetterAuthClient {
+            // Plugins may adjust the configuration (a platform plugin sets its default storage here) before it is used.
+            val registry = PluginRegistry(config.registeredPlugins)
+            config.registeredPlugins.forEach { it.configure(config) }
+            return BetterAuthClient(Transport.create(config, registry.hooks), registry)
         }
     }
 }
 
-@Serializable
-private data class SignUpRequest(
-    val name: String,
-    val email: String,
-    val password: String,
-    val image: String? = null,
-    @SerialName("callbackURL") val callbackUrl: String? = null,
-)
+/** `BetterAuthClient { baseUrl = "..." }` */
+public fun BetterAuthClient(configure: BetterAuthConfig.() -> Unit): BetterAuthClient =
+    BetterAuthClient.create(BetterAuthConfig().apply(configure))
 
-@Serializable
-private data class SignInRequest(
-    val email: String,
-    val password: String,
-    @SerialName("callbackURL") val callbackUrl: String? = null,
-)
+/** Like [BetterAuthClient.request], decoding into [T]. */
+public suspend inline fun <reified T> BetterAuthClient.request(
+    method: String,
+    path: String,
+    body: JsonElement? = null,
+    query: Map<String, String?> = emptyMap(),
+): BetterAuthResult<T> = request(method, path, serializer<T>(), body, query)
 
-@Serializable
-private data class SignOutResponse(
-    val success: Boolean,
-)
+private fun accountSelection(
+    accountId: String?,
+    useAccountCookie: Boolean,
+    userId: String?,
+): JsonObject =
+    jsonBody {
+        if (useAccountCookie) put("useAccountCookie", true) else put("accountId", accountId)
+        put("userId", userId)
+    }
 
-@Serializable
-private data class ApiError(
-    val message: String,
-    val code: String? = null,
-)
+private fun JsonElement.toSessionDataOrNull(): SessionData? {
+    if (this is JsonNull) return null
+    val o = asObject()
+    val session = requireNotNull(o.obj("session")) { "The session response must contain a session object" }
+    val user = requireNotNull(o.obj("user")) { "The session response must contain a user object" }
+    return SessionData(session.toSession(), user.toUser())
+}
+
+/** Bridges the internal cookie jar to the public client without exposing it. */
+internal object CookieJarAccess {
+    fun split(header: String): List<String> =
+        io.github.betterauth.client.http.CookieJar
+            .splitSetCookieHeader(header)
+}
+
+private fun SessionData.toCacheJson(): String =
+    BetterAuthJson.encodeToString(
+        JsonObject.serializer(),
+        jsonBody {
+            put("session", BetterAuthJson.encodeToJsonElement(Session.serializer(), session))
+            put("user", BetterAuthJson.encodeToJsonElement(User.serializer(), user))
+        },
+    )

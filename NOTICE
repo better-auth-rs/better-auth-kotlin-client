@@ -1,0 +1,10 @@
+Better Auth Kotlin Client includes code adapted from:
+https://github.com/timothy-mugo/better-auth-kotlin-client
+Commit: 8aaae270489e231babe1081b740a8c7a3c008135
+Author: Timothy Mugo Gachengo
+License: Apache License 2.0 (licenses/Apache-2.0.txt)
+
+Modifications by better-auth-rs include the io.github.betterauth.client package,
+build and publication configuration, protocol and storage corrections, and tests.
+Modified source files carry an adaptation notice. These files retain the
+Apache-2.0 license. Original better-auth-rs files use the MIT license in LICENSE.
